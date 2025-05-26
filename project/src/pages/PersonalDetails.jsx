@@ -25,7 +25,7 @@ function PersonalDetails() {
   const [riskScore, setRiskScore] = useState(0);
   const [advice, setAdvice] = useState('');
 
-  const API_BASE_URL = 'http://172.16.63.225:5001'; // Your backend URL
+  const API_BASE_URL = 'http://localhost:5001';
 
   useEffect(() => {
     const fetchExpenses = async () => {
@@ -99,7 +99,7 @@ function PersonalDetails() {
     const data = new FormData();
     data.append('income', formData.income || 0);
     data.append('expense', formData.expense || 0);
-    data.append('savings', savings); // Send calculated savings to backend
+    data.append('savings', savings);
     data.append('date', formData.date);
     data.append('notes', formData.notes || '');
 
@@ -124,7 +124,7 @@ function PersonalDetails() {
           _id: editingExpenseId,
           income: parseFloat(formData.income) || 0,
           expense: parseFloat(formData.expense) || 0,
-          savings: savings, // Use calculated savings
+          savings: savings,
           date: formData.date,
           notes: formData.notes || '',
           created_at: response.data.updated_at,
@@ -145,7 +145,7 @@ function PersonalDetails() {
           _id: response.data.expense_id,
           income: parseFloat(formData.income) || 0,
           expense: parseFloat(formData.expense) || 0,
-          savings: savings, // Use calculated savings
+          savings: savings,
           date: formData.date,
           notes: formData.notes || '',
           created_at: new Date().toISOString(),
@@ -290,6 +290,7 @@ function PersonalDetails() {
               <p className="text-lg text-gray-700">
                 <strong>Debt-to-Income Ratio:</strong> {debtToIncomeRatio}%
               </p>
+              <h3 className="text-lg font-semibold text-gray-900">Predict the loan risk percentage</h3>
               <p className="text-lg text-gray-700">
                 <strong>Risk Score:</strong> {riskScore}%
               </p>

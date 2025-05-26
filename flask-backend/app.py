@@ -16,18 +16,24 @@ from langchain.prompts import PromptTemplate
 from langchain.chains.question_answering import load_qa_chain
 from langchain_community.vectorstores import Weaviate
 from community import community_bp
-from profile import profile_bp
+from mongo_profile import profile_bp
 import requests
 from langdetect import detect, DetectorFactory
 import logging
-import base64  # Added for voice handling
-from werkzeug.utils import secure_filename  # Added for secure file handling
+import base64
+from werkzeug.utils import secure_filename
 
 # Load environment variables
 load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 WEAVIATE_URL = os.getenv("WEAVIATE_URL")
 WEAVIATE_API_KEY = os.getenv("WEAVIATE_API_KEY")
+
+# PlayHT API Configuration
+PLAYHT_API_KEY = os.getenv("PLAYHT_API_KEY")  # Add to your .env file
+PLAYHT_USER_ID = os.getenv("PLAYHT_USER_ID")  # Add to your .env file
+PLAYHT_TTS_ENDPOINT = "https://api.play.ht/api/v2/tts/stream"
+
 
 # Initialize Weaviate Client (v3 syntax)
 try:
@@ -46,7 +52,7 @@ except Exception as e:
     weaviate_client = None
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/api/*": {"origins": "*", "allow_headers": ["Authorization", "Content-Type"]}})
 
 # JWT Configuration
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET', 'your_jwt_secret_key')
@@ -80,7 +86,7 @@ embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_a
 SARVAM_API_KEY = "cf07b2de-ce8b-40b8-ae96-b26faeef4acd"
 SARVAM_STT_ENDPOINT = "https://api.sarvam.ai/speech-to-text"
 SARVAM_TRANSLATE_ENDPOINT = "https://api.sarvam.ai/translate"
-SARVAM_TTS_ENDPOINT = "https://api.sarvam.ai/text-to-speech"  # Confirm this endpoint with Sarvam documentation
+SARVAM_TTS_ENDPOINT = "https://api.sarvam.ai/text-to-speech"
 SUPPORTED_AUDIO_FORMATS = ["wav", "mp3"]
 SUPPORTED_LANGUAGES = ["en", "hi", "ta", "te", "kn", "ml", "gu", "mr", "bn", "pa", "or", "es"]
 MAX_TRANSLATE_CHARS = 900
@@ -93,8 +99,10 @@ if not os.path.exists(UPLOAD_FOLDER):
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 # Set up logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+logging.getLogger("pymongo").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 # Ensure consistent language detection
 DetectorFactory.seed = 0
@@ -106,42 +114,115 @@ class MultilingualError(Exception):
 
 # Detect the language of the input text
 def detect_language(text):
-    """Detect the language of the input text."""
+    """Detect the language of the input text with fallback for short or ambiguous inputs."""
     if not text.strip():
         logger.error("Cannot detect language: Input text is empty")
         raise MultilingualError("Cannot detect language: Input text is empty")
 
     try:
+        # For very short inputs (< 3 characters), assume English to avoid false positives
+        if len(text.strip()) < 3:
+            logger.debug("Text too short for reliable detection, assuming English")
+            return "en"
+        
         lang = detect(text)
         logger.debug(f"Detected language: {lang}")
+        
+        # If detected language isn’t supported, default to English
+        if lang not in SUPPORTED_LANGUAGES:
+            logger.warning(f"Detected language '{lang}' not supported, defaulting to English")
+            return "en"
+        
         return lang
     except Exception as e:
         logger.error(f"Language detection failed: {str(e)}")
         raise MultilingualError(f"Language detection failed: {str(e)}")
+    
 
 # Translate the input text to English using Sarvam's Translation API
 def translate_to_english(text, source_language=None):
-    """Translate the input text to English using Sarvam's Translation API."""
+    """Translate only non-English words in the input text to English using Sarvam's Translation API."""
     try:
-        if not source_language:
-            source_language = detect_language(text)
+        # Split the text into words while preserving punctuation and spaces
+        import re
+        words = re.findall(r'\S+|\s+', text)  # Matches non-whitespace (words) and whitespace (spaces)
+        translated_words = []
 
-        if source_language == "en":
-            logger.debug("Text is already in English, skipping translation")
-            return text
+        for word in words:
+            # Skip if it's just whitespace
+            if word.isspace():
+                translated_words.append(word)
+                continue
 
-        if source_language not in SUPPORTED_LANGUAGES:
-            logger.warning(
-                f"Language '{source_language}' is not supported by Sarvam API. Returning original text: {text}")
-            return text
+            # Detect language of the individual word
+            try:
+                word_lang = detect(word)
+            except Exception:
+                word_lang = "en"  # Default to English if detection fails for a single word
 
+            if word_lang == "en":
+                # If the word is already in English, keep it as is
+                translated_words.append(word)
+            else:
+                # Translate non-English word
+                if word_lang not in SUPPORTED_LANGUAGES:
+                    logger.warning(f"Language '{word_lang}' not supported. Keeping word: {word}")
+                    translated_words.append(word)
+                    continue
+
+                language_mapping = {
+                    'en': 'en-IN', 'hi': 'hi-IN', 'ta': 'ta-IN', 'te': 'te-IN', 'kn': 'kn-IN',
+                    'ml': 'ml-IN', 'gu': 'gu-IN', 'mr': 'mr-IN', 'bn': 'bn-IN', 'pa': 'pa-IN',
+                    'or': 'od-IN', 'es': 'es'
+                }
+                source_lang_code = language_mapping.get(word_lang, word_lang + '-IN')
+                target_lang_code = 'en-IN'
+
+                payload = {
+                    'input': word,
+                    'source_language_code': source_lang_code,
+                    'target_language_code': target_lang_code
+                }
+                headers = {
+                    'api-subscription-key': SARVAM_API_KEY,
+                    'Content-Type': 'application/json'
+                }
+                logger.debug(f"Sending translation request for word '{word}' - Payload: {payload}")
+                response = requests.post(SARVAM_TRANSLATE_ENDPOINT, json=payload, headers=headers, timeout=10)
+
+                if response.status_code == 200:
+                    result = response.json()
+                    translated_text = result.get('translated_text', result.get('output', word))
+                    translated_words.append(translated_text if translated_text else word)
+                else:
+                    logger.error(f"Translation API error for '{word}': {response.status_code} - {response.text}")
+                    translated_words.append(word)  # Keep original word on failure
+        # Reconstruct the text
+        return ''.join(translated_words)
+
+    except Exception as e:
+        logger.error(f"Error in translate_to_english: {str(e)}")
+        raise MultilingualError(f"Error in translate_to_english: {str(e)}")    
+
+
+# Translate English response back to the user's language
+def translate_to_user_language(text, target_language):
+    """Translate the English response back to the user's language using Sarvam API if supported."""
+    # Define Sarvam-supported languages
+    sarvam_supported_languages = ['en', 'hi', 'bn', 'gu', 'kn', 'ml', 'mr', 'or', 'pa', 'ta', 'te']
+    
+    if target_language == "en" or target_language not in sarvam_supported_languages:
+        logger.debug(f"No translation needed or language '{target_language}' not supported by Sarvam, returning English")
+        return text
+
+    try:
         language_mapping = {
             'en': 'en-IN', 'hi': 'hi-IN', 'ta': 'ta-IN', 'te': 'te-IN', 'kn': 'kn-IN',
             'ml': 'ml-IN', 'gu': 'gu-IN', 'mr': 'mr-IN', 'bn': 'bn-IN', 'pa': 'pa-IN',
-            'or': 'od-IN', 'es': 'es'
+            'or': 'od-IN'
         }
-        source_lang_code = language_mapping.get(source_language, source_language + '-IN')
-        target_lang_code = 'en-IN'
+        source_lang_code = 'en-IN'
+        target_lang_code = language_mapping.get(target_language, target_language + '-IN')
 
         if len(text) > MAX_TRANSLATE_CHARS:
             chunks = [text[i:i + MAX_TRANSLATE_CHARS] for i in range(0, len(text), MAX_TRANSLATE_CHARS)]
@@ -156,7 +237,7 @@ def translate_to_english(text, source_language=None):
                     'api-subscription-key': SARVAM_API_KEY,
                     'Content-Type': 'application/json'
                 }
-                logger.debug(f"Sending translation request - Payload: {payload}")
+                logger.debug(f"Sending translation request (English to {target_language}) - Payload: {payload}")
                 response = requests.post(SARVAM_TRANSLATE_ENDPOINT, json=payload, headers=headers, timeout=30)
                 if response.status_code == 200:
                     result = response.json()
@@ -165,7 +246,8 @@ def translate_to_english(text, source_language=None):
                         raise MultilingualError("Translation API returned empty text")
                     translated_chunks.append(translated_text)
                 else:
-                    raise MultilingualError(f"Translation API error: {response.status_code} - {response.text}")
+                    logger.error(f"Translation API error: {response.status_code} - {response.text}")
+                    return text  # Return original text on failure
             return ' '.join(translated_chunks)
 
         payload = {
@@ -177,93 +259,24 @@ def translate_to_english(text, source_language=None):
             'api-subscription-key': SARVAM_API_KEY,
             'Content-Type': 'application/json'
         }
-        logger.debug(f"Sending translation request - Payload: {payload}")
+        logger.debug(f"Sending translation request (English to {target_language}) - Payload: {payload}")
         response = requests.post(SARVAM_TRANSLATE_ENDPOINT, json=payload, headers=headers, timeout=30)
 
         if response.status_code == 200:
             result = response.json()
             translated_text = result.get('translated_text', result.get('output', ''))
             if not translated_text:
-                logger.error("Translation API returned empty text")
                 raise MultilingualError("Translation API returned empty text")
-            logger.debug(f"Translation successful: {translated_text}")
+            logger.debug(f"Translated response to {target_language}: {translated_text}")
             return translated_text
         else:
             logger.error(f"Translation API error: {response.status_code} - {response.text}")
-            raise MultilingualError(f"Translation API error: {response.status_code} - {response.text}")
-
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Network error during translation: {str(e)}")
-        raise MultilingualError(f"Network error during translation: {str(e)}")
+            return text  # Return original text on failure
     except Exception as e:
-        logger.error(f"Error in translate_to_english: {str(e)}")
-        raise MultilingualError(f"Error in translate_to_english: {str(e)}")
+        logger.error(f"Error translating response to {target_language}: {str(e)}")
+        return text  # Return original text on exception
+    
 
-# Translate English response back to the user's language
-def translate_to_user_language(text, target_language):
-    """Translate the English response back to the user's language using Sarvam API."""
-    if target_language == "en":
-        return text
-
-    try:
-        language_mapping = {
-            'en': 'en-IN', 'hi': 'hi-IN', 'ta': 'ta-IN', 'te': 'te-IN', 'kn': 'kn-IN',
-            'ml': 'ml-IN', 'gu': 'gu-IN', 'mr': 'mr-IN', 'bn': 'bn-IN', 'pa': 'pa-IN',
-            'or': 'od-IN', 'es': 'es'
-        }
-        source_lang_code = 'en-IN'
-        target_lang_code = language_mapping.get(target_language, target_language)
-
-        if len(text) > MAX_TRANSLATE_CHARS:
-            chunks = [text[i:i + MAX_TRANSLATE_CHARS] for i in range(0, len(text), MAX_TRANSLATE_CHARS)]
-            translated_chunks = []
-            for chunk in chunks:
-                payload = {
-                    'input': chunk,
-                    'source_language_code': source_lang_code,
-                    'target_language_code': target_lang_code
-                }
-                headers = {
-                    'api-subscription-key': SARVAM_API_KEY,
-                    'Content-Type': 'application/json'
-                }
-                print(f"Sending translation request (English to {target_language}) - Payload: {payload}")
-                response = requests.post(SARVAM_TRANSLATE_ENDPOINT, json=payload, headers=headers, timeout=30)
-                if response.status_code == 200:
-                    result = response.json()
-                    translated_text = result.get('translated_text', result.get('output', ''))
-                    if not translated_text:
-                        raise MultilingualError("Translation API returned empty text for response translation")
-                    translated_chunks.append(translated_text)
-                else:
-                    raise MultilingualError(f"Translation API error: {response.status_code} - {response.text}")
-            return ' '.join(translated_chunks)
-
-        payload = {
-            'input': text,
-            'source_language_code': source_lang_code,
-            'target_language_code': target_lang_code
-        }
-        headers = {
-            'api-subscription-key': SARVAM_API_KEY,
-            'Content-Type': 'application/json'
-        }
-        print(f"Sending translation request (English to {target_language}) - Payload: {payload}")
-        response = requests.post(SARVAM_TRANSLATE_ENDPOINT, json=payload, headers=headers, timeout=30)
-
-        if response.status_code == 200:
-            result = response.json()
-            translated_text = result.get('translated_text', result.get('output', ''))
-            if not translated_text:
-                raise MultilingualError("Translation API returned empty text for response translation")
-            print(f"Translated response to {target_language}: {translated_text}")
-            return translated_text
-        else:
-            print(f"Translation API error (English to {target_language}): {response.status_code} - {response.text}")
-            return f"Translation failed, response in English: {text}"
-    except Exception as e:
-        print(f"Error translating response to {target_language}: {str(e)}")
-        return f"Translation failed, response in English: {text}"
 
 # Helper function for voice file validation
 def allowed_file(filename):
@@ -275,43 +288,42 @@ def speech_to_text(audio_file_path, language_code="ta-IN"):
     """Convert audio to text using Sarvam AI's Speech-to-Text API."""
     try:
         with open(audio_file_path, "rb") as audio_file:
-            audio_data = audio_file.read()
-            audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+            files = {
+                'file': ('audio.wav', audio_file, 'audio/wav'),
+                'language_code': (None, language_code)
+            }
+            headers = {
+                'api-subscription-key': SARVAM_API_KEY,
+                'Accept': 'application/json'
+            }
+            logger.debug(f"Sending STT request for file: {audio_file_path} with language: {language_code}")
+            response = requests.post(SARVAM_STT_ENDPOINT, files=files, headers=headers, timeout=30)
 
-        payload = {
-            "audio": audio_base64,
-            "language_code": language_code
-        }
-        headers = {
-            'api-subscription-key': SARVAM_API_KEY,
-            'Content-Type': 'application/json'
-        }
-        logger.debug(f"Sending STT request - Payload: {payload}")
-        response = requests.post(SARVAM_STT_ENDPOINT, json=payload, headers=headers, timeout=30)
+            print(f"Sarvam STT API raw response: {response.text}")
+            logger.debug(f"Sarvam STT API raw response: {response.text}")
 
-        if response.status_code == 200:
-            result = response.json()
-            transcribed_text = result.get('transcription', '')
-            if not transcribed_text:
-                raise MultilingualError("STT API returned empty transcription")
-            logger.debug(f"STT successful: {transcribed_text}")
-            return transcribed_text
-        else:
-            logger.error(f"STT API error: {response.status_code} - {response.text}")
-            raise MultilingualError(f"STT API error: {response.status_code} - {response.text}")
+            if response.status_code == 200:
+                result = response.json()
+                transcribed_text = result.get('transcript', '')  # Use 'transcript' instead of 'transcription'
+                if not transcribed_text:
+                    raise MultilingualError("STT API returned empty transcription")
+                logger.debug(f"STT successful: {transcribed_text}")
+                return transcribed_text
+            else:
+                logger.error(f"STT API error: {response.status_code} - {response.text}")
+                raise MultilingualError(f"STT API error: {response.status_code} - {response.text}")
 
     except Exception as e:
         logger.error(f"Error in speech_to_text: {str(e)}")
         raise MultilingualError(f"Error in speech_to_text: {str(e)}")
 
-# Text-to-Speech using Sarvam AI
+
 def text_to_speech(text, language_code="ta-IN", voice_id="default"):
     """Convert text to audio using Sarvam AI's Text-to-Speech API."""
     try:
         payload = {
-            "text": text,
-            "language_code": language_code,
-            "voice_id": voice_id
+            "inputs": [text],
+            "target_language_code": language_code
         }
         headers = {
             'api-subscription-key': SARVAM_API_KEY,
@@ -320,12 +332,22 @@ def text_to_speech(text, language_code="ta-IN", voice_id="default"):
         logger.debug(f"Sending TTS request - Payload: {payload}")
         response = requests.post(SARVAM_TTS_ENDPOINT, json=payload, headers=headers, timeout=30)
 
+        # Log raw response fully
+        raw_response = response.text
+        logger.debug(f"Sarvam TTS API raw response: {raw_response[:500]}... (total length: {len(raw_response)})")
+
         if response.status_code == 200:
             result = response.json()
+            logger.debug(f"Parsed TTS response: {result}")  # Log full parsed JSON
+
+            # Explicitly check for 'audio' key
             audio_base64 = result.get('audio', '')
             if not audio_base64:
+                logger.error(f"No 'audio' key found or value is empty in response: {result}")
                 raise MultilingualError("TTS API returned empty audio")
-            
+
+            logger.debug(f"Extracted audio_base64: {audio_base64[:50]}... (length: {len(audio_base64)})")
+
             audio_data = base64.b64decode(audio_base64)
             output_path = os.path.join(app.config['UPLOAD_FOLDER'], "response_audio.wav")
             with open(output_path, "wb") as f:
@@ -456,6 +478,7 @@ def format_response_to_html(text):
     in_list = False
     current_section = None
 
+    
     for line in lines:
         line = line.strip()
         if not line:
@@ -541,6 +564,7 @@ def register():
             'residentialAddressPermanent': residential_address_permanent,
             'nationality': nationality,
             'profileCompleted': profile_completed,
+            'expenses': [],  # Initialize empty expenses array
             'createdAt': datetime.utcnow()
         }
         result = users_collection.insert_one(user)
@@ -618,7 +642,7 @@ def update_profile():
             return_document=True
         )
         if not user:
-            return jsonify({'message': 'User not found'}), 400
+            return jsonify({'message': 'User not found'}), 404
 
         formatted_data = format_user_data(user)
         print(f"Updated user data for _id {user_id}: {formatted_data}")
@@ -663,6 +687,122 @@ def update_profile():
         print(f"Profile update error: {e}")
         return jsonify({'message': f'Error updating profile: {str(e)}'}), 500
 
+# Fetch Expenses Route
+@app.route('/api/profile/expenses', methods=['GET'])
+@jwt_required()
+def get_expenses():
+    try:
+        user_id = get_jwt_identity()
+        user = users_collection.find_one({'_id': ObjectId(user_id)})
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+
+        expenses = user.get('expenses', [])
+        # Convert ObjectId to string for each expense
+        for expense in expenses:
+            expense['_id'] = str(expense['_id'])
+        logger.info(f"Fetched {len(expenses)} expenses for user {user_id}")
+        return jsonify(expenses)
+    except Exception as e:
+        logger.error(f"Error fetching expenses for user {user_id}: {str(e)}")
+        return jsonify({'error': f'Error fetching expenses: {str(e)}'}), 500
+
+# Add Expense Route
+@app.route('/api/profile/expenses', methods=['POST'])
+@jwt_required()
+def add_expense():
+    try:
+        user_id = get_jwt_identity()
+        data = request.form  # Expecting form data from frontend
+        income = float(data.get('income', 0))
+        expense = float(data.get('expense', 0))
+        savings = float(data.get('savings', 0))  # Expecting frontend to send savings
+        date = data.get('date')
+        notes = data.get('notes', '')
+
+        if not date or (income == 0 and expense == 0):
+            return jsonify({'error': 'Date and at least one of income or expense are required'}), 400
+
+        expense_entry = {
+            '_id': ObjectId(),
+            'income': income,
+            'expense': expense,
+            'savings': savings,
+            'date': date,
+            'notes': notes,
+            'created_at': datetime.utcnow().isoformat()
+        }
+
+        result = users_collection.update_one(
+            {'_id': ObjectId(user_id)},
+            {'$push': {'expenses': expense_entry}}
+        )
+        if result.modified_count == 0:
+            return jsonify({'error': 'Failed to add expense. User not found or no changes made.'}), 404
+
+        logger.info(f"Added expense for user {user_id}: {expense_entry}")
+        return jsonify({'expense_id': str(expense_entry['_id']), 'message': 'Expense added successfully'}), 201
+    except Exception as e:
+        logger.error(f"Error adding expense for user {user_id}: {str(e)}")
+        return jsonify({'error': f'Error adding expense: {str(e)}'}), 500
+
+# Update Expense Route
+@app.route('/api/profile/expenses/<expense_id>', methods=['PUT'])
+@jwt_required()
+def update_expense(expense_id):
+    try:
+        user_id = get_jwt_identity()
+        data = request.form
+        income = float(data.get('income', 0))
+        expense = float(data.get('expense', 0))
+        savings = float(data.get('savings', 0))
+        date = data.get('date')
+        notes = data.get('notes', '')
+
+        if not date or (income == 0 and expense == 0):
+            return jsonify({'error': 'Date and at least one of income or expense are required'}), 400
+
+        expense_entry = {
+            'income': income,
+            'expense': expense,
+            'savings': savings,
+            'date': date,
+            'notes': notes,
+            'updated_at': datetime.utcnow().isoformat()
+        }
+
+        result = users_collection.update_one(
+            {'_id': ObjectId(user_id), 'expenses._id': ObjectId(expense_id)},
+            {'$set': {f'expenses.$.': {**expense_entry, '_id': ObjectId(expense_id)}}}
+        )
+        if result.modified_count == 0:
+            return jsonify({'error': 'Expense not found or no changes made'}), 404
+
+        logger.info(f"Updated expense {expense_id} for user {user_id}")
+        return jsonify({'message': 'Expense updated successfully', 'updated_at': expense_entry['updated_at']})
+    except Exception as e:
+        logger.error(f"Error updating expense {expense_id} for user {user_id}: {str(e)}")
+        return jsonify({'error': f'Error updating expense: {str(e)}'}), 500
+
+# Delete Expense Route
+@app.route('/api/profile/expenses/<expense_id>', methods=['DELETE'])
+@jwt_required()
+def delete_expense(expense_id):
+    try:
+        user_id = get_jwt_identity()
+        result = users_collection.update_one(
+            {'_id': ObjectId(user_id)},
+            {'$pull': {'expenses': {'_id': ObjectId(expense_id)}}}
+        )
+        if result.modified_count == 0:
+            return jsonify({'error': 'Expense not found or already deleted'}), 404
+
+        logger.info(f"Deleted expense {expense_id} for user {user_id}")
+        return jsonify({'message': 'Expense deleted successfully'})
+    except Exception as e:
+        logger.error(f"Error deleting expense {expense_id} for user {user_id}: {str(e)}")
+        return jsonify({'error': f'Error deleting expense: {str(e)}'}), 500
+
 # Loan Eligibility Route
 @app.route('/api/loan-eligibility', methods=['POST'])
 @jwt_required()
@@ -693,7 +833,6 @@ def get_user_details():
         formatted_data = format_user_data(user)
         print(f"Fetched user details for _id {user_id}: {formatted_data}")
         return jsonify({'userDetails': formatted_data})
-
     except Exception as e:
         print(f"User details error: {e}")
         return jsonify({'message': f'Error fetching user details: {str(e)}'}), 500
@@ -707,26 +846,40 @@ def debug_db():
     except Exception as e:
         return jsonify({'message': f'Failed to connect to MongoDB: {str(e)}'}), 500
 
-# Chat Route for Text-Based Conversation
+# JWT Error Handlers
+@jwt.unauthorized_loader
+def unauthorized_callback(error):
+    logger.error(f"Unauthorized access: Missing or invalid token - {str(error)}")
+    return jsonify({'error': 'Unauthorized: Missing or invalid token'}), 401
+
+@jwt.expired_token_loader
+def expired_token_callback(jwt_header, jwt_payload):
+    logger.error(f"Token expired for user: {jwt_payload.get('sub')}")
+    return jsonify({'error': 'Token has expired. Please log in again.'}), 401
+
+@jwt.invalid_token_loader
+def invalid_token_callback(error):
+    logger.error(f"Invalid token: {str(error)}")
+    return jsonify({'error': 'Invalid token provided.'}), 401
+
+# Chat Route
 @app.route('/api/chat', methods=['POST'])
 @jwt_required()
 def chat():
     data = request.get_json()
     user_message = data.get('message')
     user_id = get_jwt_identity()
-    print(f"User {user_id} entered in chat: {user_message}")
+    logger.info(f"User {user_id} entered in chat: {user_message}")
+    logger.debug(f"Request headers: {request.headers.get('Authorization')}")
 
     if not user_message:
         return jsonify({'error': 'Message required'}), 400
 
     try:
         original_language = detect_language(user_message)
-        print(f"Original language detected: {original_language}")
-        if original_language != "en":
-            user_message_english = translate_to_english(user_message, original_language)
-            print(f"Translated user message to English: {user_message_english}")
-        else:
-            user_message_english = user_message
+        logger.info(f"Primary language detected: {original_language}")
+        user_message_english = translate_to_english(user_message)
+        logger.info(f"Message with non-English words translated: {user_message_english}")
 
         eligibility_keywords = ["eligible", "eligibility", "criteria", "requirements", "verify", "check", "checking", "assess", "qualify", "suitability"]
         apply_keywords = ["apply", "application", "how to", "steps"]
@@ -768,67 +921,38 @@ def chat():
 
         chain = get_conversational_chain()
 
-        is_eligibility = any(keyword in user_message_english.lower() for keyword in eligibility_keywords)
-        is_apply = any(keyword in user_message_english.lower() for keyword in apply_keywords)
-        is_interest = any(keyword in user_message_english.lower() for keyword in interest_keywords)
-        is_help = any(keyword in user_message_english.lower() for keyword in help_keywords)
-
-        print(f"Keyword checks - Eligibility: {is_eligibility}, Apply: {is_apply}, Interest: {is_interest}, Help: {is_help}")
-
         if any(keyword in user_message_english.lower() for keyword in ["hi", "hello", "hey"]):
             response = get_general_response(user_message_english, user_profile)
         elif "name" in user_message_english.lower() and "?" in user_message_english:
             response = get_general_response(user_message_english, user_profile)
         elif is_eligibility:
-            print(f"Matched eligibility query: {user_message_english}")
             response = chain.invoke({
                 "input_documents": admin_docs,
                 "user_profile": user_profile,
                 "question": f"Hi {user_name}! {user_message_english} Provide eligibility criteria for a car loan based on the admin guidelines. If income, debt, or other details are needed, guide me to provide them."
             })['output_text']
-        elif is_apply:
-            response = chain.invoke({
-                "input_documents": admin_docs,
-                "user_profile": user_profile,
-                "question": f"Hi {user_name}! {user_message_english} Provide steps to apply for a car loan based on the admin guidelines."
-            })['output_text']
-        elif is_interest:
-            response = chain.invoke({
-                "input_documents": admin_docs,
-                "user_profile": user_profile,
-                "question": f"Hi {user_name}! {user_message_english} Provide interest rates for car loans based on the admin guidelines."
-            })['output_text']
-        elif is_help:
-            response = chain.invoke({
-                "input_documents": admin_docs,
-                "user_profile": user_profile,
-                "question": f"Hi {user_name}! I’m here to guide you! {user_message_english} How can I assist with your loan process today?"
-            })['output_text']
         else:
-            print(f"No specific match, assuming eligibility for loan query: {user_message_english}")
             response = chain.invoke({
                 "input_documents": admin_docs,
                 "user_profile": user_profile,
-                "question": f"Hi {user_name}! {user_message_english} Provide eligibility criteria or general information for a car loan based on the admin guidelines."
+                "question": f"Hi {user_name}! {user_message_english} Provide general information about loans."
             })['output_text']
 
-        if original_language != "en":
-            response = translate_to_user_language(response, original_language)
-
+        response = translate_to_user_language(response, original_language)
         formatted_response = format_response_to_html(response)
-        print(f"Raw response: {response}")
-        print(f"Formatted response: {formatted_response}")
+        logger.info(f"Raw response: {response}")
+        logger.info(f"Formatted response: {formatted_response}")
         return jsonify({'response': formatted_response})
     except Exception as e:
-        print(f"Error processing chat request: {str(e)}")
+        logger.error(f"Error processing chat request: {str(e)}")
         return jsonify({'error': f"Oops! Something went wrong. Please try again later. Error: {str(e)}"}), 500
 
-# Voice Chat Route for Voice-Based Conversation
+# Voice Chat Route
 @app.route('/api/voice-chat', methods=['POST'])
 @jwt_required()
 def voice_chat():
     user_id = get_jwt_identity()
-    
+
     if 'audio' not in request.files:
         return jsonify({'error': 'No audio file provided'}), 400
 
@@ -838,37 +962,35 @@ def voice_chat():
 
     if audio_file and allowed_file(audio_file.filename):
         filename = secure_filename(audio_file.filename)
-        audio_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        audio_file.save(audio_path)
-        print(f"User {user_id} uploaded audio: {audio_path}")
+        input_audio_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        audio_file.save(input_audio_path)
+        logger.info(f"User {user_id} uploaded audio: {input_audio_path}")
 
         try:
-            # Step 1: Convert audio to text (Speech-to-Text)
-            user_language = "ta-IN"  # Assume Tamil for now
-            user_message = speech_to_text(audio_path, language_code=user_language)
-            print(f"Transcribed audio to text: {user_message}")
+            # Step 1: Transcribe audio to text (Sarvam STT)
+            user_language_code = "ta-IN"
+            transcribed_text = speech_to_text(input_audio_path, language_code=user_language_code)
+            logger.info(f"Transcribed audio to text: {transcribed_text}")
 
-            # Step 2: Detect language of the transcribed text
-            original_language = detect_language(user_message)
-            print(f"Original language detected: {original_language}")
+            # Step 2: Detect language
+            original_language = detect_language(transcribed_text)
+            logger.info(f"Detected original language: {original_language}")
 
-            # Step 3: Translate to English if non-English
+            # Step 3: Translate to English if needed
             if original_language != "en":
-                user_message_english = translate_to_english(user_message, original_language)
-                print(f"Translated user message to English: {user_message_english}")
+                user_message_english = translate_to_english(transcribed_text)
+                logger.info(f"Translated to English: {user_message_english}")
             else:
-                user_message_english = user_message
+                user_message_english = transcribed_text
+                logger.info(f"Text already in English: {user_message_english}")
 
-            # Step 4: Process the query
-            eligibility_keywords = ["eligible", "eligibility", "criteria", "requirements", "verify", "check", "checking", "assess", "qualify", "suitability"]
-            apply_keywords = ["apply", "application", "how to", "steps"]
-            interest_keywords = ["interest", "rate", "cost"]
-            help_keywords = ["help", "guide"]
-
+            # Step 4: Process with chat logic
+            eligibility_keywords = ["eligible", "eligibility", "criteria", "requirements", "verify", "check",
+                                   "checking", "assess", "qualify", "suitability"]
             is_eligibility = any(keyword in user_message_english.lower() for keyword in eligibility_keywords)
             if not is_eligibility and "loan" in user_message_english.lower():
                 user_message_english = f"{user_message_english} Please check eligibility."
-                print(f"Rephrased query for eligibility: {user_message_english}")
+                logger.info(f"Rephrased query for eligibility: {user_message_english}")
 
             user_class_name = f"User_{user_id}"
             user_vector_store = Weaviate(
@@ -896,81 +1018,145 @@ def voice_chat():
                 by_text=False
             )
             admin_docs = admin_vector_store.similarity_search(user_message_english, k=10)
-            print(f"Retrieved admin documents: {admin_docs}")
+            logger.info(f"Retrieved admin documents: {len(admin_docs)}")
 
             chain = get_conversational_chain()
-
-            is_eligibility = any(keyword in user_message_english.lower() for keyword in eligibility_keywords)
-            is_apply = any(keyword in user_message_english.lower() for keyword in apply_keywords)
-            is_interest = any(keyword in user_message_english.lower() for keyword in interest_keywords)
-            is_help = any(keyword in user_message_english.lower() for keyword in help_keywords)
-
-            print(f"Keyword checks - Eligibility: {is_eligibility}, Apply: {is_apply}, Interest: {is_interest}, Help: {is_help}")
 
             if any(keyword in user_message_english.lower() for keyword in ["hi", "hello", "hey"]):
                 response = get_general_response(user_message_english, user_profile)
             elif "name" in user_message_english.lower() and "?" in user_message_english:
                 response = get_general_response(user_message_english, user_profile)
             elif is_eligibility:
-                print(f"Matched eligibility query: {user_message_english}")
                 response = chain.invoke({
                     "input_documents": admin_docs,
                     "user_profile": user_profile,
-                    "question": f"Hi {user_name}! {user_message_english} Provide eligibility criteria for a car loan based on the admin guidelines. If income, debt, or other details are needed, guide me to provide them."
-                })['output_text']
-            elif is_apply:
-                response = chain.invoke({
-                    "input_documents": admin_docs,
-                    "user_profile": user_profile,
-                    "question": f"Hi {user_name}! {user_message_english} Provide steps to apply for a car loan based on the admin guidelines."
-                })['output_text']
-            elif is_interest:
-                response = chain.invoke({
-                    "input_documents": admin_docs,
-                    "user_profile": user_profile,
-                    "question": f"Hi {user_name}! {user_message_english} Provide interest rates for car loans based on the admin guidelines."
-                })['output_text']
-            elif is_help:
-                response = chain.invoke({
-                    "input_documents": admin_docs,
-                    "user_profile": user_profile,
-                    "question": f"Hi {user_name}! I’m here to guide you! {user_message_english} How can I assist with your loan process today?"
+                    "question": f"Hi {user_name}! {user_message_english} Provide eligibility criteria for a car loan based on the admin guidelines."
                 })['output_text']
             else:
-                print(f"No specific match, assuming eligibility for loan query: {user_message_english}")
                 response = chain.invoke({
                     "input_documents": admin_docs,
                     "user_profile": user_profile,
-                    "question": f"Hi {user_name}! {user_message_english} Provide eligibility criteria or general information for a car loan based on the admin guidelines."
+                    "question": f"Hi {user_name}! {user_message_english} Provide general information about loans."
                 })['output_text']
+            logger.info(f"Generated response: {response}")
 
-            # Step 5: Translate the response back to the user's language
+            # Step 5: Translate response back to original language
             if original_language != "en":
-                response = translate_to_user_language(response, original_language)
-                print(f"Translated response to {original_language}: {response}")
+                response_translated = translate_to_user_language(response, original_language)
+                logger.info(f"Translated response to {original_language}: {response_translated}")
+            else:
+                response_translated = response
+                logger.info(f"Response kept in English: {response_translated}")
 
-            # Step 6: Convert the response text to audio (Text-to-Speech)
-            audio_output_path = text_to_speech(response, language_code=user_language)
+            # Step 6: Format response as HTML
+            formatted_response = format_response_to_html(response_translated)
+            logger.info(f"Formatted response: {formatted_response}")
 
-            # Step 7: Read the audio file and encode it as base64
-            with open(audio_output_path, "rb") as audio_file:
+            # Step 7: Convert response to audio (Try PlayHT, fallback to Sarvam)
+            output_audio_path = os.path.join(app.config['UPLOAD_FOLDER'], f"response_{user_id}.mp3")
+            try:
+                # Map language to PlayHT's supported format
+                playht_language = original_language if original_language in ["en", "ta"] else "en"  # Tamil is beta in PlayDialog
+                headers = {
+                    "Authorization": PLAYHT_API_KEY,
+                    "X-USER-ID": PLAYHT_USER_ID,
+                    "accept": "audio/mpeg",
+                    "content-type": "application/json"
+                }
+                payload = {
+                    "text": response_translated,
+                    "voice": "s3://voice-cloning-zero-shot/d9ff78ba-d016-47f6-b0ef-dd630f59414e/female-cs/manifest.json",
+                    "output_format": "mp3",
+                    "voice_engine": "Play3.0-mini",  # Fastest option
+                    "language": playht_language
+                }
+                logger.info(f"Sending PlayHT TTS request with text: {response_translated}")
+                response_tts = requests.post(
+                    PLAYHT_TTS_ENDPOINT,
+                    json=payload,
+                    headers=headers,
+                    stream=True,
+                    timeout=30
+                )
+                if response_tts.status_code == 200:
+                    with open(output_audio_path, "wb") as f:
+                        for chunk in response_tts.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                    logger.info(f"PlayHT TTS successful, audio saved to: {output_audio_path}")
+                elif response_tts.status_code == 403:
+                    raise Exception("PlayHT API access denied due to plan restrictions")
+                else:
+                    raise Exception(f"PlayHT TTS failed: {response_tts.status_code} - {response_tts.text}")
+
+            except Exception as playht_error:
+                logger.warning(f"PlayHT TTS failed: {str(playht_error)}. Falling back to Sarvam TTS.")
+                output_audio_path = text_to_speech(
+                    response_translated,
+                    language_code="ta-IN" if original_language == "ta" else "en-IN"
+                )
+                logger.info(f"Sarvam TTS successful, audio saved to: {output_audio_path}")
+
+            with open(output_audio_path, "rb") as audio_file:
                 audio_data = audio_file.read()
                 audio_base64 = base64.b64encode(audio_data).decode('utf-8')
 
-            # Clean up temporary files
-            os.remove(audio_path)
-            os.remove(audio_output_path)
+            # Step 8: Clean up temporary files
+            for path in [input_audio_path, output_audio_path]:
+                if os.path.exists(path):
+                    os.remove(path)
+                    logger.debug(f"Cleaned up file: {path}")
 
-            return jsonify({
-                'transcribed_text': user_message,
-                'response_text': response,
+            # Step 9: Return full response
+            response_data = {
+                'transcribed_text': transcribed_text,
+                'response_text': response_translated,
+                'response_html': formatted_response,
                 'response_audio': audio_base64
-            })
+            }
+            logger.info(f"Returning response: {response_data.keys()}")
+            return jsonify(response_data)
+
         except Exception as e:
-            print(f"Error processing voice chat request: {str(e)}")
-            return jsonify({'error': f"Oops! Something went wrong. Please try again later. Error: {str(e)}"}), 500
+            logger.error(f"Error processing voice chat request: {str(e)}")
+            for path in [input_audio_path, output_audio_path]:
+                if os.path.exists(path):
+                    os.remove(path)
+            return jsonify({'error': f"Oops! Something went wrong. Error: {str(e)}"}), 500
     else:
         return jsonify({'error': 'Invalid file format. Only WAV and MP3 are supported.'}), 400
+
+
+# Optional: Add PlayHT TTS function if you want audio later
+def playht_text_to_speech(text, language="en"):
+    try:
+        headers = {
+            "X-USER-ID": PLAYHT_USER_ID,
+            "AUTHORIZATION": PLAYHT_API_KEY,
+            "accept": "audio/mpeg",
+            "content-type": "application/json"
+        }
+        payload = {
+            "text": text,
+            "voice_engine": "Play3.0-mini",  # Fastest option
+            "voice": "s3://voice-cloning-zero-shot/d9ff78ba-d016-47f6-b0ef-dd630f59414e/female-cs/manifest.json",
+            # Example voice
+            "output_format": "mp3",
+            "language": language  # Map your language codes to PlayHT’s supported languages
+        }
+        response = requests.post(PLAYHT_TTS_ENDPOINT, json=payload, headers=headers, timeout=30)
+        if response.status_code == 200:
+            audio_path = os.path.join(app.config['UPLOAD_FOLDER'], "playht_response.mp3")
+            with open(audio_path, "wb") as f:
+                f.write(response.content)
+            logger.info(f"PlayHT TTS successful, audio saved to: {audio_path}")
+            return audio_path
+        else:
+            logger.error(f"PlayHT TTS error: {response.status_code} - {response.text}")
+            raise Exception(f"PlayHT TTS error: {response.status_code}")
+    except Exception as e:
+        logger.error(f"Error in PlayHT TTS: {str(e)}")
+        raise
 
 # Admin Setup Route
 @app.route('/api/setup-admin', methods=['POST'])
@@ -1011,4 +1197,4 @@ def setup_admin():
     return jsonify({'message': 'Admin data initialized'}), 200
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5001)
+    app.run(debug=False, host='0.0.0.0', port=5001)

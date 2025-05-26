@@ -37,7 +37,7 @@ expense_collection = db['user_expenses']
 # Load the pre-trained model with fallback
 loan_safety_model = None
 try:
-    model_path = os.path.join(os.path.dirname(__file__), 'loan_safety_model.pkl')
+    model_path = os.path.join(os.path.dirname(__file__), 'default_risk_model.pkl')
     if os.path.exists(model_path):
         loan_safety_model = joblib.load(model_path)
         print("Successfully loaded loan safety model")
