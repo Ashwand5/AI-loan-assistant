@@ -86,28 +86,3 @@ AI-loan-assistant/
 └── README.md               # Project documentation
 ```
 
-## Contributing
-Contributions are welcome! To contribute:
-1. Fork the repository.
-2. Create a branch:
-   ```bash
-   git checkout -b feature/your-feature-name
-   ```
-3. Commit changes:
-   ```bash
-   git commit -m "Add your feature description"
-   ```
-4. Push to your branch:
-   ```bash
-   git push origin feature/your-feature-name
-   ```
-5. Open a pull request.
-
-Ensure code adheres to the project’s style and includes tests.
-
-## License
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-- Thanks to the open-source community for tools like scikit-learn, pandas, and matplotlib.
-- Dataset sourced from [specify if known, e.g., Kaggle or public domain].
